@@ -4,6 +4,13 @@ os:
 sudo: false
 dist: trusty
 
+branches:
+  except:
+  - /.*appveyor.*/
+
+git:
+  quiet: true
+
 env:
   matrix:
     - EVENT_BUILD_METHOD=cmake EVENT_CMAKE_OPTIONS="-DEVENT__COVERAGE=ON -DCMAKE_BUILD_TYPE=debug" COVERALLS=yes
@@ -24,6 +31,7 @@ matrix:
       env: EVENT_BUILD_METHOD=cmake EVENT_CMAKE_OPTIONS="-DEVENT__COVERAGE=ON -DCMAKE_BUILD_TYPE=debug" COVERALLS=yes
   allow_failures:
     - os: osx
+  fast_finish: true
 
 language: c
 compiler:
@@ -37,10 +45,6 @@ before_install:
   - export JOBS=20
   - export TIMEOUT=50
   - if [ "$TRAVIS_OS_NAME" == "osx" ]; then
-      brew update;
-      brew uninstall libtool && brew install libtool;
-      brew install openssl;
-      brew install lcov;
       if [ "$CC" == "gcc" ]; then
         export CC=$(ls -t /usr/local/bin/gcc-?.?);
       fi
@@ -53,7 +57,7 @@ before_install:
         CFLAGS=-I$CMAKE_INCLUDE_PATH
         LDFLAGS=-L$CMAKE_LIBRARY_PATH;
 
-      export JOBS=4;
+      export JOBS=1;
     fi
 
 addons:
@@ -69,13 +73,19 @@ addons:
     - autoconf
     - cmake
     - lcov
+  homebrew:
+    packages:
+    - openssl
+    - lcov
+    - libtool
+
 
 script:
   - if [ "$EVENT_BUILD_METHOD" = "autotools" ]; then
       ./autogen.sh &&
       ./configure $EVENT_CONFIGURE_OPTIONS &&
       make &&
-      travis_retry travis_wait $TIMEOUT make -j $JOBS verify;
+      travis_wait $TIMEOUT make -j $JOBS verify;
     fi
   - if [ "$EVENT_BUILD_METHOD" = "cmake" ]; then
       export
@@ -85,7 +95,7 @@ script:
       mkdir build &&
       cd build &&
       cmake .. $EVENT_CMAKE_OPTIONS &&
-      travis_retry travis_wait $TIMEOUT
+      travis_wait $TIMEOUT
       cmake --build . --target verify;
     fi
 
@@ -101,6 +111,3 @@ after_script:
         --exclude build/CMakeFiles/CompilerIdC
         --gcov-options '\-lp';
     fi
-
-notifications:
-  irc: "irc.oftc.net#libevent"

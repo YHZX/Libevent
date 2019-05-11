@@ -27,6 +27,12 @@ endif()
 if (POLICY CMP0054)
     cmake_policy(SET CMP0054 NEW)
 endif()
+if (POLICY CMP0074)
+    cmake_policy(SET CMP0074 NEW)
+endif()
+if (POLICY CMP0075)
+    cmake_policy(SET CMP0075 NEW)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release
@@ -153,6 +159,11 @@ if (EVENT__ENABLE_VERBOSE_DEBUG)
     add_definitions(-DUSE_DEBUG=1)
 endif()
 
+# make it colorful under ninja-build
+if ("${CMAKE_GENERATOR}" STREQUAL "Ninja")
+    add_compiler_flags(-fdiagnostics-color=always)
+endif()
+
 # Setup compiler flags for coverage.
 if (EVENT__COVERAGE)
     if (NOT "${CMAKE_BUILD_TYPE_LOWER}" STREQUAL "debug")
@@ -166,14 +177,44 @@ if (EVENT__COVERAGE)
     set(CMAKE_REQUIRED_LIBRARIES "")
 endif()
 
-# GCC specific options.
-if (CMAKE_COMPILER_IS_GNUCC)
+set(GNUC 0)
+set(CLANG 0)
+if (("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang") OR
+    ("${CMAKE_C_COMPILER_ID}" STREQUAL "AppleClang"))
+    set(CLANG 1)
+endif()
+if ((${CMAKE_C_COMPILER_ID} STREQUAL GNU) OR (${CLANG}))
+    set(GNUC 1)
+endif()
+
+# GNUC specific options.
+if (${GNUC})
     option(EVENT__DISABLE_GCC_WARNINGS "Disable verbose warnings with GCC" OFF)
     option(EVENT__ENABLE_GCC_HARDENING "Enable compiler security checks" OFF)
     option(EVENT__ENABLE_GCC_FUNCTION_SECTIONS "Enable gcc function sections" OFF)
     option(EVENT__ENABLE_GCC_WARNINGS "Make all GCC warnings into errors" OFF)
 
-    list(APPEND __FLAGS -Wall -Wswitch)
+    set(GCC_V ${CMAKE_C_COMPILER_VERSION})
+
+    list(APPEND __FLAGS
+         -Wall -Wextra -Wno-unused-parameter -Wstrict-aliasing
+
+         -fno-strict-aliasing # gcc 2.9.5+
+
+         # gcc 4
+         -Winit-self
+         -Wmissing-field-initializers
+         -Wdeclaration-after-statement
+
+         # gcc 4.2
+         -Waddress
+         -Wno-unused-function
+         -Wnormalized=id
+         -Woverride-init
+
+         # gcc 4.5
+         -Wlogical-op
+    )
 
     if (EVENT__DISABLE_GCC_WARNINGS)
         list(APPEND __FLAGS -w)
@@ -199,10 +240,6 @@ if (CMAKE_COMPILER_IS_GNUCC)
         list(APPEND __FLAGS -Werror)
     endif()
 
-    # We need to test for at least gcc 2.95 here, because older versions don't
-    # have -fno-strict-aliasing
-    list(APPEND __FLAGS -fno-strict-aliasing)
-
     add_compiler_flags(${__FLAGS})
 endif()
 
@@ -225,7 +262,7 @@ if (SOLARIS)
 endif()
 
 # Check if _GNU_SOURCE is available.
-if (NOT _GNU_SOURCE)
+if (NOT DEFINED _GNU_SOURCE)
   CHECK_SYMBOL_EXISTS(__GNU_LIBRARY__ "features.h" _GNU_SOURCE)
 
   if (NOT _GNU_SOURCE)
@@ -412,7 +449,7 @@ endif()
 check_function_keywords("inline" "__inline" "__inline__")
 
 if (HAVE_INLINE)
-    set (EVENT__inline inline)
+    set(EVENT__inline inline)
 elseif (HAVE___INLINE)
     set(EVENT__inline __inline)
 elseif(HAVE___INLINE__)
@@ -420,6 +457,10 @@ elseif(HAVE___INLINE__)
 else()
     set(EVENT__inline)
 endif()
+
+# __func__/__FUNCTION__ is not a macros in general
+CHECK_SYMBOL_EXISTS("__func__"     "" EVENT__HAVE___func__)
+CHECK_SYMBOL_EXISTS("__FUNCTION__" "" EVENT__HAVE___FUNCTION__)
 
 CHECK_SYMBOL_EXISTS(TAILQ_FOREACH sys/queue.h EVENT__HAVE_TAILQFOREACH)
 CHECK_CONST_EXISTS(CTL_KERN sys/sysctl.h EVENT__HAVE_DECL_CTL_KERN)
@@ -471,10 +512,8 @@ endif()
 
 CHECK_TYPE_SIZE(pid_t EVENT__SIZEOF_PID_T)
 if(NOT EVENT__SIZEOF_PID_T)
-  set(EVENT__pid_t "int")
   set(EVENT__SIZEOF_PID_T ${EVENT__SIZEOF_INT})
 else()
-	set(EVENT__pid_t "pid_t")
 	set(EVENT__SIZEOF_PID_T EVENT__SIZEOF_PID_T)
 endif()
 
@@ -514,10 +553,6 @@ if (EVENT__HAVE_KQUEUE)
         include(CheckWorkingKqueue)
     endif()
 endif()
-
-CHECK_SYMBOL_EXISTS(_MINIX "stdio.h" EVENT___MINIX)
-CHECK_SYMBOL_EXISTS(_POSIX_1_SOURCE "stdio.h" EVENT___POSIX_1_SOURCE)
-CHECK_SYMBOL_EXISTS(_POSIX_SOURCE "stdio.h" EVENT___POSIX_SOURCE)
 
 if(EVENT__HAVE_NETDB_H)
     list(APPEND CMAKE_EXTRA_INCLUDE_FILES netdb.h)
@@ -779,9 +814,7 @@ source_group("Source Extra"     FILES ${SRC_EXTRA})
 # (Place them in the build dir so we don't polute the source tree with generated files).
 include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR}/include)
 
-if ((CMAKE_COMPILER_IS_GNUCC) OR
-    ("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang") OR
-    ("${CMAKE_C_COMPILER_ID}" STREQUAL "AppleClang"))
+if (${GNUC})
     set(EVENT_SHARED_FLAGS -fvisibility=hidden)
 elseif ("${CMAKE_C_COMPILER_ID}" STREQUAL "SunPro")
     set(EVENT_SHARED_FLAGS -xldscope=hidden)
@@ -855,7 +888,6 @@ if (NOT EVENT__DISABLE_SAMPLES)
         event-read-fifo
         hello-world
         signal-test
-        http-server
         http-connect
         time-test)
 
@@ -872,7 +904,13 @@ if (NOT EVENT__DISABLE_SAMPLES)
                         sample/le-proxy.c)
     endif()
 
-    add_sample_prog(OFF dns-example sample/dns-example.c ${WIN32_GETOPT})
+    set(SAMPLES_WOPT
+        dns-example
+        http-server
+    )
+    foreach (SAMPLE ${SAMPLES_WOPT})
+        add_sample_prog(OFF ${SAMPLE} sample/${SAMPLE}.c ${WIN32_GETOPT})
+    endforeach()
 endif()
 
 #
@@ -1360,25 +1398,25 @@ message(STATUS "")
 message(STATUS "        ---( Libevent " ${EVENT_VERSION} " )---")
 message(STATUS "")
 message(STATUS "Available event backends: ${BACKENDS}")
-message(STATUS "CMAKE_BINARY_DIR:         " ${CMAKE_BINARY_DIR})
-message(STATUS "CMAKE_CURRENT_BINARY_DIR: " ${CMAKE_CURRENT_BINARY_DIR})
-message(STATUS "CMAKE_SOURCE_DIR:         " ${CMAKE_SOURCE_DIR})
-message(STATUS "CMAKE_CURRENT_SOURCE_DIR: " ${CMAKE_CURRENT_SOURCE_DIR})
-message(STATUS "PROJECT_BINARY_DIR:       " ${PROJECT_BINARY_DIR})
-message(STATUS "PROJECT_SOURCE_DIR:       " ${PROJECT_SOURCE_DIR})
-message(STATUS "CMAKE_MODULE_PATH:        " ${CMAKE_MODULE_PATH})
-message(STATUS "CMAKE_COMMAND:            " ${CMAKE_COMMAND})
-message(STATUS "CMAKE_ROOT:               " ${CMAKE_ROOT} )
-message(STATUS "CMAKE_SYSTEM:             " ${CMAKE_SYSTEM} )
-message(STATUS "CMAKE_SYSTEM_NAME:        " ${CMAKE_SYSTEM_NAME} )
-message(STATUS "CMAKE_SYSTEM_VERSION:     " ${CMAKE_SYSTEM_VERSION} )
-message(STATUS "CMAKE_SYSTEM_PROCESSOR:   " ${CMAKE_SYSTEM_PROCESSOR} )
-message(STATUS "CMAKE_SKIP_RPATH:         " ${CMAKE_SKIP_RPATH} )
-message(STATUS "CMAKE_VERBOSE_MAKEFILE:   " ${CMAKE_VERBOSE_MAKEFILE} )
-message(STATUS "CMAKE_C_FLAGS:            " ${CMAKE_C_FLAGS} )
-message(STATUS "CMAKE_BUILD_TYPE:         " ${CMAKE_BUILD_TYPE} )
-message(STATUS "CMAKE_C_COMPILER:         " ${CMAKE_C_COMPILER} )
-message(STATUS "CMAKE_AR:                 " ${CMAKE_AR} )
-message(STATUS "CMAKE_RANLIB:             " ${CMAKE_RANLIB} )
+message(STATUS "CMAKE_BINARY_DIR:         ${CMAKE_BINARY_DIR}")
+message(STATUS "CMAKE_CURRENT_BINARY_DIR: ${CMAKE_CURRENT_BINARY_DIR}")
+message(STATUS "CMAKE_SOURCE_DIR:         ${CMAKE_SOURCE_DIR}")
+message(STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
+message(STATUS "PROJECT_BINARY_DIR:       ${PROJECT_BINARY_DIR}")
+message(STATUS "PROJECT_SOURCE_DIR:       ${PROJECT_SOURCE_DIR}")
+message(STATUS "CMAKE_MODULE_PATH:        ${CMAKE_MODULE_PATH}")
+message(STATUS "CMAKE_COMMAND:            ${CMAKE_COMMAND}")
+message(STATUS "CMAKE_ROOT:               ${CMAKE_ROOT}")
+message(STATUS "CMAKE_SYSTEM:             ${CMAKE_SYSTEM}")
+message(STATUS "CMAKE_SYSTEM_NAME:        ${CMAKE_SYSTEM_NAME}")
+message(STATUS "CMAKE_SYSTEM_VERSION:     ${CMAKE_SYSTEM_VERSION}")
+message(STATUS "CMAKE_SYSTEM_PROCESSOR:   ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "CMAKE_SKIP_RPATH:         ${CMAKE_SKIP_RPATH}")
+message(STATUS "CMAKE_VERBOSE_MAKEFILE:   ${CMAKE_VERBOSE_MAKEFILE}")
+message(STATUS "CMAKE_C_FLAGS:            ${CMAKE_C_FLAGS}")
+message(STATUS "CMAKE_BUILD_TYPE:         ${CMAKE_BUILD_TYPE}")
+message(STATUS "CMAKE_C_COMPILER:         ${CMAKE_C_COMPILER} (id ${CMAKE_C_COMPILER_ID}, clang ${CLANG}, GNUC ${GNUC})")
+message(STATUS "CMAKE_AR:                 ${CMAKE_AR}")
+message(STATUS "CMAKE_RANLIB:             ${CMAKE_RANLIB}")
 message(STATUS "")
 

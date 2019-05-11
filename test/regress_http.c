@@ -120,7 +120,7 @@ https_bev(struct event_base *base, void *arg)
 {
 	SSL *ssl = SSL_new(get_ssl_ctx());
 
-	SSL_use_certificate(ssl, ssl_getcert());
+	SSL_use_certificate(ssl, ssl_getcert(ssl_getkey()));
 	SSL_use_PrivateKey(ssl, ssl_getkey());
 
 	return bufferevent_openssl_socket_new(
@@ -150,6 +150,7 @@ http_setup_gencb(ev_uint16_t *pport, struct event_base *base, int mask,
 
 	/* Register a callback for certain types of requests */
 	evhttp_set_cb(myhttp, "/test", http_basic_cb, myhttp);
+	evhttp_set_cb(myhttp, "/test nonconformant", http_basic_cb, myhttp);
 	evhttp_set_cb(myhttp, "/timeout", http_timeout_cb, myhttp);
 	evhttp_set_cb(myhttp, "/large", http_large_cb, base);
 	evhttp_set_cb(myhttp, "/chunked", http_chunked_cb, base);
@@ -315,7 +316,7 @@ http_basic_cb(struct evhttp_request *req, void *arg)
 	struct evhttp_connection *evcon;
 	int empty = evhttp_find_header(evhttp_request_get_input_headers(req), "Empty") != NULL;
 
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 	evbuffer_add_printf(evb, BASIC_REQUEST_BODY);
 
 	evcon = evhttp_request_get_connection(req);
@@ -437,7 +438,7 @@ http_chunked_cb(struct evhttp_request *req, void *arg)
 {
 	struct timeval when = { 0, 0 };
 	struct chunk_req_state *state = malloc(sizeof(struct chunk_req_state));
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 
 	memset(state, 0, sizeof(struct chunk_req_state));
 	state->req = req;
@@ -453,16 +454,6 @@ http_chunked_cb(struct evhttp_request *req, void *arg)
 	/* but trickle it across several iterations to ensure we're not
 	 * assuming it comes all at once */
 	event_base_once(arg, -1, EV_TIMEOUT, http_chunked_trickle_cb, state, &when);
-}
-
-static void
-http_complete_write(evutil_socket_t fd, short what, void *arg)
-{
-	struct bufferevent *bev = arg;
-	const char *http_request = "host\r\n"
-	    "Connection: close\r\n"
-	    "\r\n";
-	bufferevent_write(bev, http_request, strlen(http_request));
 }
 
 static struct bufferevent *
@@ -493,19 +484,34 @@ create_bev(struct event_base *base, int fd, int ssl_mask)
 }
 
 static void
-http_basic_test_impl(void *arg, int ssl)
+http_half_writecb(struct bufferevent *bev, void *arg)
+{
+	if (evbuffer_get_length(bufferevent_get_output(bev)) == 0) {
+		if (!test_ok) {
+			const char http_request[] = "host\r\n"
+				"Connection: close\r\n"
+				"\r\n";
+			bufferevent_write(bev, http_request, strlen(http_request));
+		}
+		/* enable reading of the reply */
+		bufferevent_enable(bev, EV_READ);
+		test_ok++;
+	}
+}
+
+static void
+http_basic_test_impl(void *arg, int ssl, const char *request_line)
 {
 	struct basic_test_data *data = arg;
-	struct timeval tv;
 	struct bufferevent *bev = NULL;
 	evutil_socket_t fd;
 	const char *http_request;
 	ev_uint16_t port = 0, port2 = 0;
 	int server_flags = ssl ? HTTP_BIND_SSL : 0;
 	struct evhttp *http = http_setup(&port, data->base, server_flags);
+	struct evbuffer *out;
 
 	exit_base = data->base;
-	test_ok = 0;
 
 	/* bind to a second socket */
 	if (http_bind(http, &port2, server_flags) == -1) {
@@ -517,23 +523,18 @@ http_basic_test_impl(void *arg, int ssl)
 
 	/* Stupid thing to send a request */
 	bev = create_bev(data->base, fd, ssl);
-	bufferevent_setcb(bev, http_readcb, http_writecb,
+	bufferevent_setcb(bev, http_readcb, http_half_writecb,
 	    http_errorcb, data->base);
+	out = bufferevent_get_output(bev);
 
 	/* first half of the http request */
-	http_request =
-	    "GET /test HTTP/1.1\r\n"
-	    "Host: some";
+	evbuffer_add_printf(out,
+	    "%s\r\n"
+	    "Host: some", request_line);
 
-	bufferevent_write(bev, http_request, strlen(http_request));
-	evutil_timerclear(&tv);
-	tv.tv_usec = 100000;
-	event_base_once(data->base,
-	    -1, EV_TIMEOUT, http_complete_write, bev, &tv);
-
+	test_ok = 0;
 	event_base_dispatch(data->base);
-
-	tt_assert(test_ok == 3);
+	tt_int_op(test_ok, ==, 3);
 
 	/* connect to the second port */
 	bufferevent_free(bev);
@@ -545,18 +546,17 @@ http_basic_test_impl(void *arg, int ssl)
 	bev = create_bev(data->base, fd, ssl);
 	bufferevent_setcb(bev, http_readcb, http_writecb,
 	    http_errorcb, data->base);
+	out = bufferevent_get_output(bev);
 
-	http_request =
-	    "GET /test HTTP/1.1\r\n"
+	evbuffer_add_printf(out,
+	    "%s\r\n"
 	    "Host: somehost\r\n"
 	    "Connection: close\r\n"
-	    "\r\n";
+	    "\r\n", request_line);
 
-	bufferevent_write(bev, http_request, strlen(http_request));
-
+	test_ok = 0;
 	event_base_dispatch(data->base);
-
-	tt_assert(test_ok == 5);
+	tt_int_op(test_ok, ==, 2);
 
 	/* Connect to the second port again. This time, send an absolute uri. */
 	bufferevent_free(bev);
@@ -577,16 +577,19 @@ http_basic_test_impl(void *arg, int ssl)
 
 	bufferevent_write(bev, http_request, strlen(http_request));
 
+	test_ok = 0;
 	event_base_dispatch(data->base);
-
-	tt_assert(test_ok == 7);
+	tt_int_op(test_ok, ==, 2);
 
 	evhttp_free(http);
- end:
+end:
 	if (bev)
 		bufferevent_free(bev);
 }
-static void http_basic_test(void *arg) { http_basic_test_impl(arg, 0); }
+static void http_basic_test(void *arg)\
+{ http_basic_test_impl(arg, 0, "GET /test HTTP/1.1"); }
+static void http_basic_trailing_space_test(void *arg)
+{ http_basic_test_impl(arg, 0, "GET /test HTTP/1.1 "); }
 
 
 static void
@@ -625,7 +628,7 @@ http_badreq_cb(struct evhttp_request *req, void *arg)
 static void
 http_badreq_errorcb(struct bufferevent *bev, short what, void *arg)
 {
-	event_debug(("%s: called (what=%04x, arg=%p)", __func__, what, arg));
+	TT_BLATHER(("%s: called (what=%04x, arg=%p)", __func__, what, arg));
 	/* ignore */
 }
 
@@ -671,7 +674,7 @@ http_badreq_readcb(struct bufferevent *bev, void *arg)
 static void
 http_badreq_successcb(evutil_socket_t fd, short what, void *arg)
 {
-	event_debug(("%s: called (what=%04x, arg=%p)", __func__, what, arg));
+	TT_BLATHER(("%s: called (what=%04x, arg=%p)", __func__, what, arg));
 	event_base_loopexit(exit_base, NULL);
 }
 
@@ -787,7 +790,7 @@ http_delete_cb(struct evhttp_request *req, void *arg)
 		exit(1);
 	}
 
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 	evbuffer_add_printf(evb, BASIC_REQUEST_BODY);
 
 	/* allow sending of an empty reply */
@@ -858,7 +861,7 @@ http_sent_cb(struct evhttp_request *req, void *arg)
 		exit(1);
 	}
 
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 
 	++test_ok;
 }
@@ -870,7 +873,7 @@ http_on_complete_cb(struct evhttp_request *req, void *arg)
 
 	evhttp_request_set_on_complete_cb(req, http_sent_cb, (void *)0xDEADBEEF);
 
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 	evbuffer_add_printf(evb, BASIC_REQUEST_BODY);
 
 	/* allow sending of an empty reply */
@@ -1865,7 +1868,7 @@ http_dispatcher_cb(struct evhttp_request *req, void *arg)
 {
 
 	struct evbuffer *evb = evbuffer_new();
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 	evbuffer_add_printf(evb, "DISPATCHER_TEST");
 
 	evhttp_send_reply(req, HTTP_OK, "Everything is fine", evb);
@@ -2023,7 +2026,7 @@ void
 http_post_cb(struct evhttp_request *req, void *arg)
 {
 	struct evbuffer *evb;
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 
 	/* Yes, we are expecting a post request */
 	if (evhttp_request_get_command(req) != EVHTTP_REQ_POST) {
@@ -2140,7 +2143,7 @@ void
 http_put_cb(struct evhttp_request *req, void *arg)
 {
 	struct evbuffer *evb;
-	event_debug(("%s: called\n", __func__));
+	TT_BLATHER(("%s: called\n", __func__));
 
 	/* Expecting a PUT request */
 	if (evhttp_request_get_command(req) != EVHTTP_REQ_PUT) {
@@ -2489,6 +2492,83 @@ http_parse_query_test(void *ptr)
 	tt_want(validate_header(&headers, "q2", "") == 0);
 	tt_want(validate_header(&headers, "q3", "") == 0);
 	evhttp_clear_headers(&headers);
+
+end:
+	evhttp_clear_headers(&headers);
+}
+static void
+http_parse_query_str_test(void *ptr)
+{
+	struct evkeyvalq headers;
+	int r;
+
+	TAILQ_INIT(&headers);
+
+	r = evhttp_parse_query_str("http://www.test.com/?q=test", &headers);
+	tt_assert(evhttp_find_header(&headers, "q") == NULL);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+	r = evhttp_parse_query_str("q=test", &headers);
+	tt_want(validate_header(&headers, "q", "test") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+end:
+	evhttp_clear_headers(&headers);
+}
+static void
+http_parse_query_str_flags_test(void *ptr)
+{
+	struct evkeyvalq headers;
+	int r;
+
+	TAILQ_INIT(&headers);
+
+	/** ~EVHTTP_URI_QUERY_LAST_VAL */
+	r = evhttp_parse_query_str_flags("q=test&q=test2", &headers, 0);
+	tt_want(validate_header(&headers, "q", "test") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+	/** EVHTTP_URI_QUERY_LAST_VAL */
+	r = evhttp_parse_query_str_flags("q=test&q=test2", &headers, EVHTTP_URI_QUERY_LAST_VAL);
+	tt_want(validate_header(&headers, "q", "test2") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+	/** ~EVHTTP_URI_QUERY_NONCONFORMANT */
+	r = evhttp_parse_query_str_flags("q=test&q2", &headers, 0);
+	tt_int_op(r, ==, -1);
+	evhttp_clear_headers(&headers);
+
+	r = evhttp_parse_query_str_flags("q=test&&q2=test2", &headers, 0);
+	tt_int_op(r, ==, -1);
+	evhttp_clear_headers(&headers);
+
+	r = evhttp_parse_query_str_flags("q=test&=1&q2=test2", &headers, 0);
+	tt_int_op(r, ==, -1);
+	evhttp_clear_headers(&headers);
+
+	/** EVHTTP_URI_QUERY_NONCONFORMANT */
+	r = evhttp_parse_query_str_flags("q=test&q2", &headers, EVHTTP_URI_QUERY_NONCONFORMANT);
+	tt_want(validate_header(&headers, "q", "test") == 0);
+	tt_want(validate_header(&headers, "q2", "") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+	r = evhttp_parse_query_str_flags("q=test&&q2=test2", &headers, EVHTTP_URI_QUERY_NONCONFORMANT);
+	tt_want(validate_header(&headers, "q", "test") == 0);
+	tt_want(validate_header(&headers, "q2", "test2") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
+	r = evhttp_parse_query_str_flags("q=test&=1&q2=test2", &headers, EVHTTP_URI_QUERY_NONCONFORMANT);
+	tt_want(validate_header(&headers, "q", "test") == 0);
+	tt_want(validate_header(&headers, "q2", "test2") == 0);
+	tt_int_op(r, ==, 0);
+	evhttp_clear_headers(&headers);
+
 
 end:
 	evhttp_clear_headers(&headers);
@@ -3642,7 +3722,7 @@ http_make_web_server(evutil_socket_t fd, short what, void *arg)
 }
 
 static void
-http_simple_test_impl(void *arg, int ssl, int dirty)
+http_simple_test_impl(void *arg, int ssl, int dirty, const char *uri)
 {
 	struct basic_test_data *data = arg;
 	struct evhttp_connection *evcon = NULL;
@@ -3667,9 +3747,8 @@ http_simple_test_impl(void *arg, int ssl, int dirty)
 	req = evhttp_request_new(http_request_done, (void*) BASIC_REQUEST_BODY);
 	tt_assert(req);
 
-	if (evhttp_make_request(evcon, req, EVHTTP_REQ_GET, "/test") == -1) {
+	if (evhttp_make_request(evcon, req, EVHTTP_REQ_GET, uri) == -1)
 		tt_abort_msg("Couldn't make request");
-	}
 
 	event_base_dispatch(data->base);
 	tt_int_op(test_ok, ==, 1);
@@ -3681,7 +3760,9 @@ http_simple_test_impl(void *arg, int ssl, int dirty)
 		evhttp_free(http);
 }
 static void http_simple_test(void *arg)
-{ http_simple_test_impl(arg, 0, 0); }
+{ http_simple_test_impl(arg, 0, 0, "/test"); }
+static void http_simple_nonconformant_test(void *arg)
+{ http_simple_test_impl(arg, 0, 0, "/test nonconformant"); }
 
 static void
 http_connection_retry_test_basic(void *arg, const char *addr, struct evdns_base *dns_base, int ssl)
@@ -4000,7 +4081,6 @@ http_large_entity_test_done(struct evhttp_request *req, void *arg)
 end:
 	event_base_loopexit(arg, NULL);
 }
-#ifndef WIN32
 static void
 http_expectation_failed_done(struct evhttp_request *req, void *arg)
 {
@@ -4009,7 +4089,6 @@ http_expectation_failed_done(struct evhttp_request *req, void *arg)
 end:
 	event_base_loopexit(arg, NULL);
 }
-#endif
 
 static void
 http_data_length_constraints_test_impl(void *arg, int read_on_write_error)
@@ -4026,10 +4105,8 @@ http_data_length_constraints_test_impl(void *arg, int read_on_write_error)
 
 	test_ok = 0;
 	cb = http_failed_request_done;
-#ifndef WIN32
 	if (read_on_write_error)
 		cb = http_data_length_constraints_test_done;
-#endif
 
 	tt_assert(continue_size < size);
 
@@ -4073,10 +4150,8 @@ http_data_length_constraints_test_impl(void *arg, int read_on_write_error)
 	}
 	event_base_dispatch(data->base);
 
-#ifndef WIN32
 	if (read_on_write_error)
 		cb = http_large_entity_test_done;
-#endif
 	evhttp_set_max_body_size(http, size - 2);
 	req = evhttp_request_new(cb, data->base);
 	evhttp_add_header(evhttp_request_get_output_headers(req), "Host", "somehost");
@@ -4105,10 +4180,8 @@ http_data_length_constraints_test_impl(void *arg, int read_on_write_error)
 	}
 	event_base_dispatch(data->base);
 
-#ifndef WIN32
 	if (read_on_write_error)
 		cb = http_expectation_failed_done;
-#endif
 	req = evhttp_request_new(cb, data->base);
 	evhttp_add_header(evhttp_request_get_output_headers(req), "Host", "somehost");
 	evhttp_add_header(evhttp_request_get_output_headers(req), "Expect", "101-continue");
@@ -4761,17 +4834,17 @@ http_newreqcb_test(void *arg)
 
 #ifdef EVENT__HAVE_OPENSSL
 static void https_basic_test(void *arg)
-{ http_basic_test_impl(arg, 1); }
+{ http_basic_test_impl(arg, 1, "GET /test HTTP/1.1"); }
 static void https_filter_basic_test(void *arg)
-{ http_basic_test_impl(arg, 1 | HTTP_SSL_FILTER); }
+{ http_basic_test_impl(arg, 1 | HTTP_SSL_FILTER, "GET /test HTTP/1.1"); }
 static void https_incomplete_test(void *arg)
 { http_incomplete_test_(arg, 0, 1); }
 static void https_incomplete_timeout_test(void *arg)
 { http_incomplete_test_(arg, 1, 1); }
 static void https_simple_test(void *arg)
-{ http_simple_test_impl(arg, 1, 0); }
+{ http_simple_test_impl(arg, 1, 0, "/test"); }
 static void https_simple_dirty_test(void *arg)
-{ http_simple_test_impl(arg, 1, 1); }
+{ http_simple_test_impl(arg, 1, 1, "/test"); }
 static void https_connection_retry_conn_address_test(void *arg)
 { http_connection_retry_conn_address_test_impl(arg, 1); }
 static void https_connection_retry_test(void *arg)
@@ -4797,11 +4870,15 @@ struct testcase_t http_testcases[] = {
 	{ "base", http_base_test, TT_FORK, NULL, NULL },
 	{ "bad_headers", http_bad_header_test, 0, NULL, NULL },
 	{ "parse_query", http_parse_query_test, 0, NULL, NULL },
+	{ "parse_query_str", http_parse_query_str_test, 0, NULL, NULL },
+	{ "parse_query_str_flags", http_parse_query_str_flags_test, 0, NULL, NULL },
 	{ "parse_uri", http_parse_uri_test, 0, NULL, NULL },
 	{ "parse_uri_nc", http_parse_uri_test, 0, &basic_setup, (void*)"nc" },
 	{ "uriencode", http_uriencode_test, 0, NULL, NULL },
 	HTTP(basic),
+	HTTP(basic_trailing_space),
 	HTTP(simple),
+	HTTP(simple_nonconformant),
 
 	HTTP_N(cancel, cancel, BASIC),
 	HTTP_N(cancel_by_host, cancel, BY_HOST),
@@ -4891,3 +4968,8 @@ struct testcase_t http_testcases[] = {
 	END_OF_TESTCASES
 };
 
+struct testcase_t http_iocp_testcases[] = {
+	{ "simple", http_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &basic_setup, NULL },
+	{ "https_simple", https_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &basic_setup, NULL },
+	END_OF_TESTCASES
+};
